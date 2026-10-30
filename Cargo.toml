@@ -1,0 +1,42 @@
+[package]
+name = "berry-installer"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Install, update and repair engine for Berry Launcher: resumable verified downloads, Sophon and Kuro game installs, archive extraction, install state and Steam Linux Runtime management."
+authors = ["A-Berry-Team contributors"]
+license = "GPL-3.0-or-later"
+repository = "https://github.com/A-Berry-Team/berry-installer"
+readme = "README.md"
+keywords = ["installer", "downloader", "launcher", "steam", "gaming"]
+categories = ["filesystem", "network-programming"]
+publish = false
+
+[[bin]]
+name = "sophon-plan"
+path = "src/bin/sophon-plan.rs"
+
+[[bin]]
+name = "kuro-plan"
+path = "src/bin/kuro-plan.rs"
+
+[dependencies]
+tokio = { version = "1.52", features = ["macros", "fs", "io-util", "time", "sync", "rt", "rt-multi-thread"] }
+reqwest = { version = "0.13.3", features = ["stream"] }
+sha2 = "0.11.0"
+tar = "0.4.44"
+flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
+liblzma = { version = "0.4.6", features = ["static"] }
+zstd = "0.13.3"
+zip = { version = "9.1.2", default-features = false, features = ["deflate", "zstd"] }
+thiserror = "1.0"
+tracing = "0.1"
+libc = "0.2"
+md-5 = "0.11.0"
+prost = "0.14.3"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.149"
+
+[dev-dependencies]
+tempfile = "3"
