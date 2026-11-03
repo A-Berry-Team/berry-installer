@@ -72,7 +72,7 @@ impl FileEntry {
                 .chunks
                 .iter()
                 .zip(&other.chunks)
-                .all(|(a, b)| a.md5 == b.md5 && a.offset == b.offset)
+                .all(|(a, b)| a.md5 == b.md5 && a.offset == b.offset && a.len == b.len)
     }
 }
 
@@ -235,4 +235,47 @@ pub async fn fetch(http: &Http, url: &str, ctx: &JobContext) -> Result<Manifest>
         }
     }
     Err(last.expect("two attempts were made"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(size: u64, chunks: Vec<Chunk>) -> FileEntry {
+        FileEntry {
+            name: "data.bin".to_owned(),
+            path: PathBuf::from("data.bin"),
+            size,
+            md5: "file-md5".to_owned(),
+            chunks,
+            covered: true,
+        }
+    }
+
+    fn chunk(md5: &str, offset: u64, len: u64) -> Chunk {
+        Chunk {
+            name: format!("chunk-{md5}"),
+            offset,
+            len,
+            compressed_len: 10,
+            compressed_md5: "compressed".to_owned(),
+            md5: md5.to_owned(),
+        }
+    }
+
+    #[test]
+    fn unchanged_chunks_are_content_equivalent() {
+        let old = entry(8, vec![chunk("a", 0, 4), chunk("b", 4, 4)]);
+        let new = entry(8, vec![chunk("a", 0, 4), chunk("b", 4, 4)]);
+        assert!(old.same_content(&new));
+    }
+
+    #[test]
+    fn chunk_size_or_offset_changes_prevent_trusting_a_file() {
+        let old = entry(8, vec![chunk("a", 0, 4), chunk("b", 4, 4)]);
+        let changed_size = entry(8, vec![chunk("a", 0, 3), chunk("b", 4, 4)]);
+        let changed_offset = entry(8, vec![chunk("a", 1, 4), chunk("b", 4, 4)]);
+        assert!(!old.same_content(&changed_size));
+        assert!(!old.same_content(&changed_offset));
+    }
 }

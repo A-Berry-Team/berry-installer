@@ -25,6 +25,7 @@ pub mod game;
 pub mod hash;
 pub mod http;
 pub mod kuro;
+pub mod ldiff;
 pub mod progress;
 pub mod sophon;
 pub mod state;

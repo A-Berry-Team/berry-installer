@@ -3,7 +3,8 @@
 Install, update and repair engine of [Berry Launcher](https://github.com/A-Berry-Team/BerryLauncher):
 resumable, verified downloads, game installs (HoYoverse *Sophon* and Kuro Games), archive
 extraction, install state and Steam Linux Runtime management. Pure Rust, no external binaries
-(`tar`, `unzip`, `7z`) and no git dependencies.
+(`tar`, `unzip`, `7z`); the only git dependency is
+[`berry-patcher`](https://github.com/A-Berry-Team/berry-patcher), pinned by commit.
 
 Design notes and history: [`docs/INSTALLER.md`](docs/INSTALLER.md).
 
@@ -103,3 +104,38 @@ Kuro indexes) and part of the design come from
 [fischl-rs](https://github.com/TwintailTeam/fischl-rs) (TukanDev / TwintailTeam, GPL-3.0), and the
 small generic toolbox ideas from
 [anime-games-launcher](https://github.com/an-anime-team/anime-games-launcher).
+
+## LDiff / HDiffPatch
+
+HoYoverse LDiff patches are applied by [`berry-patcher`](https://github.com/A-Berry-Team/berry-patcher),
+A-Berry-Team's hardened fork of TwintailTeam's `hdiffpatch-rs` (MIT, it reads HDIFF13, HDIFF19, SF20
+and W26 patches). It is the crate's only git dependency, pinned by commit in `Cargo.toml`:
+
+```toml
+berry-patcher = { git = "https://github.com/A-Berry-Team/berry-patcher", rev = "<commit>",
+                  default-features = false, features = ["codec-all", "hash-all"] }
+```
+
+Only the codecs and digests are enabled (KrDiff is not needed: Kuro updates go through HTTP Range
+in the `kuro` module). To move to a newer patcher, change `rev`, run `cargo check -p berry-installer`
+and, in the launcher repository, `build-aux/update-cargo-sources.sh` to refresh the offline Flatpak
+sources.
+
+What `berry-patcher` changes for Berry, compared with the old `hdiffpatch-rs` adapter:
+
+* `ldiff::apply_hdiff` uses `HDiff::try_apply()` and reports the typed `berry_patcher::Error`
+  (`InvalidPatch`, `SizeMismatch`, `ChecksumMismatch`, `UnsafePath`, ...) inside
+  `InstallError::Archive`, instead of a bare `false` and a line on stderr.
+* Single-file output is written to `<output>.berry-tmp` and renamed only after the patch and the
+  digest it carries verified, so a failed patch never leaves a half-written file behind.
+* A patch that names a checksum this build cannot compute is refused, never applied unverified.
+* Header-driven allocations are bounded and decompressors cannot inflate past their declared size,
+  so a corrupt patch bundle fails with an error instead of exhausting memory or panicking.
+* `PatchOptions::auto()` lets it pipeline reading and decompression across threads.
+
+The `ldiff` module downloads the selected `DiffManifest`, requests each version-specific patch
+range from `<file_path>/<patch_id>` with HTTP Range, and persists the ranges under
+`.berry-preload/ldiff`. Pre-download never modifies live game files. During a live update, Berry
+reuses those cached ranges (or downloads any missing ones), applies them through `berry-patcher`,
+verifies original and resulting MD5/size, and atomically replaces each game file. Manifest-declared
+deletions are delayed until all selected patches have succeeded.

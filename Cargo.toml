@@ -34,6 +34,9 @@ tracing = "0.1"
 libc = "0.2"
 md-5 = "0.11.0"
 prost = "0.14.3"
+# HDiffPatch applier for LDiff updates: A-Berry-Team's fork of TwintailTeam/hdiffpatch-rs.
+# Pinned to a commit so builds (and Flatpak's offline sources) are reproducible; bump `rev` to update.
+berry-patcher = { git = "https://github.com/A-Berry-Team/berry-patcher", rev = "b3ac071e64b39192ea4d7039da821a5c10c7cf6e", default-features = false, features = ["codec-all", "hash-all"] }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.149"

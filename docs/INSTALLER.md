@@ -90,7 +90,7 @@ Rules the toolbox enforces for every manager and backend:
 * Failures are errors (`ChunksFailed`), never "completed"; no HEAD per chunk; one shared `Http`;
   cancellation aborts every task. This is what fixes the pause/resume slowdown.
 * `berry-downloads` uses it for the `Sophon` backend. (a `BERRY_LEGACY_*` switch existed until phase 5.)
-* **hdiffpatch-rs was removed in phase 5** after measuring. Chunk reuse replaces hdiff's main purpose (not
+* **hdiffpatch-rs was removed from the Sophon chunk path in phase 5** after measuring (the LDiff path, see below, still patches with HDiff). Chunk reuse replaces hdiff's main purpose (not
   re-downloading what is already there) but is weaker when data is inserted in a file (later
   chunks shift). Measure on real servers with
   `sophon-plan <game_dir> <manifest_url> <chunk_base_url>` against an older install; remove the
@@ -134,7 +134,15 @@ re-downloaded every chunk. That settled the hdiffpatch question.
 Deleted: `src/legacy/`, `proto/`, `build.rs`, the `legacy` feature, the `berry-installer` binary and
 the dependencies `zesven`, `hdiffpatch-rs`, `reqwest-middleware/retry`, `sysinfo`, `crossbeam-deque`,
 `crc64fast`, `futures-util`, `prost-build`, `protoc-bin-vendored`. The `BERRY_LEGACY_*` switches are
-gone. `berry-installer` has no git dependencies.
+gone.
+
+### LDiff patching -- `berry-patcher`
+The `ldiff` module (HoYoverse pre-download / update by patch range) applies HDiff patches through
+[`berry-patcher`](https://github.com/A-Berry-Team/berry-patcher), A-Berry-Team's fork of
+TwintailTeam's `hdiffpatch-rs`. It replaced the local `crates/hdiffpatch-rs` adapter that pulled the
+Twintail crate by git branch. It is pinned by commit (`rev` in `Cargo.toml`), compiled with
+`codec-all` + `hash-all` and without KrDiff, and called through `HDiff::try_apply()`, so failures
+are typed errors and output is atomic. `berry-installer` therefore has exactly one git dependency.
 
 ## Adding a game (target design for phases 2-4)
 

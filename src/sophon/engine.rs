@@ -49,6 +49,8 @@ use crate::progress::{JobContext, Phase, Progress, SpeedMeter};
 
 /// Files inspected or written at the same time (bounds open files and hashing threads).
 const FILES_IN_FLIGHT: usize = 4;
+/// More independent file reads during the preload-only verification pass.
+const PRELOAD_FILES_IN_FLIGHT: usize = 8;
 /// Chunk downloads in flight across all files.
 const CHUNKS_IN_FLIGHT: usize = 24;
 /// Attempts per chunk on top of the HTTP layer's own retries (bad bytes, CDN hiccups).
@@ -57,10 +59,15 @@ const CHUNK_ATTEMPTS: u32 = 3;
 /// thousands more (typically the network is simply down).
 const MAX_CHUNK_FAILURES: usize = 8;
 const DISK_MARGIN: u64 = 64 * 1024 * 1024;
+/// Distinguishes concurrent writers for the same content-addressed chunk cache entry.
+static CACHE_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 pub const WORK_DIR: &str = "downloading";
 pub const PRELOAD_DIR: &str = ".berry-preload";
 const PRELOAD_READY: &str = "READY";
+
+type RecoveredChunk = (usize, Vec<u8>);
+type ChunkInspection = (Vec<bool>, Vec<RecoveredChunk>);
 
 /// One downloadable piece of a game: the game data, or one voice pack.
 #[derive(Debug, Clone)]
@@ -185,7 +192,7 @@ impl SophonInstaller {
         ctx.cancel.check()?;
         let manifest = manifest::fetch(&self.http, &job.manifest_url, ctx).await?;
         tracing::info!(
-            "[sophon] {} {}: {} files, {} to describe, manifest {}",
+            "[sophon] {} {}: {} files, {} total manifest chunks (local diff not checked yet), manifest {}",
             action.name(),
             job.slot,
             manifest.files.len(),
@@ -266,8 +273,12 @@ struct Run {
     ctx: JobContext,
 
     chunk_sem: Arc<Semaphore>,
-    /// Compressed bytes accounted for (already right, or fetched): the progress bar's numerator.
+    /// Compressed bytes accounted for in the current phase.
     done: AtomicU64,
+    /// Total bytes for the current phase (for preload, only chunks missing locally).
+    progress_total: AtomicU64,
+    /// Results of the preload preflight, reused by the download pass to avoid hashing twice.
+    preload_inspection: Mutex<HashMap<usize, Vec<bool>>>,
     net: AtomicU64,
     /// Smoothed network speed, refreshed by the ticker.
     speed: AtomicU64,
@@ -316,6 +327,7 @@ impl Run {
         } else {
             None
         };
+        let progress_total = manifest.compressed_total();
         Ok(Self {
             action,
             http,
@@ -327,6 +339,8 @@ impl Run {
             ctx,
             chunk_sem: Arc::new(Semaphore::new(CHUNKS_IN_FLIGHT)),
             done: AtomicU64::new(0),
+            progress_total: AtomicU64::new(progress_total),
+            preload_inspection: Mutex::new(HashMap::new()),
             net: AtomicU64::new(0),
             speed: AtomicU64::new(0),
             fetching: AtomicUsize::new(0),
@@ -360,7 +374,6 @@ impl Run {
     }
 
     async fn execute(self: Arc<Self>) -> Result<Outcome> {
-        let total = self.manifest.compressed_total();
         if self.action.writes_game() {
             self.check_disk_space()?;
             for dir in &self.manifest.directories {
@@ -375,7 +388,7 @@ impl Run {
             let _ = fs::remove_file(cache.join(PRELOAD_READY));
         }
 
-        let ticker = (self.action != Action::Plan).then(|| tokio::spawn(self.clone().tick(total)));
+        let ticker = (self.action != Action::Plan).then(|| tokio::spawn(self.clone().tick()));
         let result = self.clone().process_all().await;
         if let Some(ticker) = ticker {
             ticker.abort();
@@ -383,11 +396,12 @@ impl Run {
 
         result?;
         self.ctx.cancel.check()?;
-        self.finish(total).await
+        let final_total = self.progress_total.load(Ordering::Relaxed);
+        self.finish(final_total).await
     }
 
     /// Reports progress about four times a second until aborted.
-    async fn tick(self: Arc<Self>, total: u64) {
+    async fn tick(self: Arc<Self>) {
         let mut meter = SpeedMeter::new();
         let mut last_net = 0u64;
         loop {
@@ -401,6 +415,7 @@ impl Run {
             } else {
                 Phase::Verifying
             };
+            let total = self.progress_total.load(Ordering::Relaxed);
             let current = self.done.load(Ordering::Relaxed).min(total);
             self.ctx.reporter.report(Progress {
                 phase,
@@ -423,6 +438,9 @@ impl Run {
     }
 
     async fn process_all(self: Arc<Self>) -> Result<()> {
+        if self.action == Action::Preload {
+            self.inspect_preload_target().await?;
+        }
         let file_sem = Arc::new(Semaphore::new(FILES_IN_FLIGHT));
         let mut order: Vec<usize> = (0..self.manifest.files.len()).collect();
         // Big files first: the long pole starts early and small ones fill the gaps.
@@ -477,6 +495,162 @@ impl Run {
         Ok(())
     }
 
+    /// Inspect the installed target once before a preload starts. This gives the UI the
+    /// actual missing-byte total and lets the download pass reuse the hash results.
+    async fn inspect_preload_target(self: &Arc<Self>) -> Result<()> {
+        let file_sem = Arc::new(Semaphore::new(PRELOAD_FILES_IN_FLIGHT));
+        // The previous installed manifest is also a content index: an unchanged Sophon chunk
+        // may have moved to another file or offset in the update manifest.
+        let mut candidates: HashMap<(String, u64), Vec<(PathBuf, Chunk)>> = HashMap::new();
+        if let Some((old_manifest, _)) = &self.stored {
+            for old_file in &old_manifest.files {
+                let old_path = self.game_dir.join(&old_file.path);
+                for chunk in &old_file.chunks {
+                    candidates
+                        .entry((chunk.md5.clone(), chunk.len))
+                        .or_default()
+                        .push((old_path.clone(), chunk.clone()));
+                }
+            }
+        }
+        let candidates = Arc::new(candidates);
+        let mut set: JoinSet<Result<(usize, Vec<bool>, bool)>> = JoinSet::new();
+
+        for index in 0..self.manifest.files.len() {
+            if self.stopped() {
+                break;
+            }
+            let Ok(permit) = self
+                .ctx
+                .cancel
+                .guard(file_sem.clone().acquire_owned())
+                .await
+            else {
+                break;
+            };
+
+            let Ok(permit) = permit else {
+                break;
+            };
+            let run = self.clone();
+            let candidates = candidates.clone();
+            set.spawn(async move {
+                let _permit = permit;
+                let entry = run.manifest.files[index].clone();
+                let path = run.game_dir.join(&entry.path);
+                let trusted = run.trusted(&entry)
+                    && fs::metadata(&path)
+                        .map(|m| m.len() == entry.size)
+                        .unwrap_or(false);
+
+                // Do all reads for one target file in a single blocking task. The previous
+                // implementation spawned and awaited a blocking task for every missing chunk;
+                // with tens of thousands of chunks that scheduler overhead dominated analysis.
+                let (known_ok, recovered) = if trusted {
+                    (vec![true; entry.chunks.len()], Vec::new())
+                } else {
+                    let candidates = candidates.clone();
+                    let cancel = run.ctx.cancel.clone();
+                    tokio::task::spawn_blocking(move || -> Result<ChunkInspection> {
+                        let mut known_ok =
+                            local::inspect_chunks(&path, &entry, &cancel, |_, _| {})?;
+                        let mut recovered = Vec::new();
+                        for (chunk_index, chunk) in entry.chunks.iter().enumerate() {
+                            if known_ok[chunk_index] {
+                                continue;
+                            }
+                            let Some(sources) = candidates.get(&(chunk.md5.clone(), chunk.len))
+                            else {
+                                continue;
+                            };
+                            for (source_path, source_chunk) in sources {
+                                if let Some(bytes) =
+                                    local::read_matching_chunk(source_path, source_chunk)
+                                {
+                                    known_ok[chunk_index] = true;
+                                    recovered.push((chunk_index, bytes));
+                                    break;
+                                }
+                            }
+                        }
+                        Ok((known_ok, recovered))
+                    })
+                    .await
+                    .map_err(join_error)??
+                };
+
+                // Stage verified cross-file matches asynchronously after the scan. Each cache
+                // entry is content-addressed and atomically published by write_cache.
+                for (chunk_index, bytes) in recovered {
+                    let chunk = &run.manifest.files[index].chunks[chunk_index];
+                    let raw_path = run.cache_dir().join(format!("{}.raw", chunk.name));
+                    run.write_cache(&raw_path, &bytes).await?;
+                }
+                Ok((index, known_ok, trusted))
+            });
+        }
+
+        let mut inspected = 0u64;
+        let mut missing_bytes = 0u64;
+        let mut reused_chunks = 0u64;
+        let mut missing_chunks = 0u64;
+        let mut trusted_files = 0u64;
+        let mut results = HashMap::with_capacity(self.manifest.files.len());
+
+        while let Some(joined) = set.join_next().await {
+            let (index, known_ok, trusted) = joined.map_err(join_error)??;
+            let entry = &self.manifest.files[index];
+            if trusted {
+                trusted_files += 1;
+            }
+            for (chunk, ok) in entry.chunks.iter().zip(&known_ok) {
+                inspected = inspected.saturating_add(chunk.compressed_len);
+                if *ok {
+                    reused_chunks += 1;
+                } else {
+                    missing_chunks += 1;
+                    missing_bytes = missing_bytes.saturating_add(chunk.compressed_len);
+                }
+            }
+            self.done.store(inspected, Ordering::Relaxed);
+            self.ctx.reporter.report(Progress {
+                phase: Phase::Verifying,
+                current: inspected.min(self.manifest.compressed_total()),
+                total: self.manifest.compressed_total(),
+                speed: 0,
+            });
+            results.insert(index, known_ok);
+        }
+
+        self.ctx.cancel.check()?;
+        *self
+            .preload_inspection
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = results;
+        self.files_trusted.store(trusted_files, Ordering::Relaxed);
+        self.chunks_reused.store(reused_chunks, Ordering::Relaxed);
+        self.chunks_missing.store(missing_chunks, Ordering::Relaxed);
+        self.bytes_missing.store(missing_bytes, Ordering::Relaxed);
+
+        // Switch from verification of the complete local manifest to the actual preload size.
+        self.done.store(0, Ordering::Relaxed);
+        self.progress_total.store(missing_bytes, Ordering::Relaxed);
+        self.ctx.reporter.report_now(Progress {
+            phase: Phase::Downloading,
+            current: 0,
+            total: missing_bytes,
+            speed: 0,
+        });
+        tracing::info!(
+            "[sophon] preload {}: {} chunks already present, {} missing; {:.2} GiB to download",
+            self.job.slot,
+            reused_chunks,
+            missing_chunks,
+            missing_bytes as f64 / 1024f64.powi(3),
+        );
+        Ok(())
+    }
+
     /// File-level errors end up here: chunk problems are counted, disk problems are fatal.
     fn record(&self, error: InstallError) {
         match error {
@@ -525,8 +699,10 @@ impl Run {
                 .map(|m| m.len() == entry.size)
                 .unwrap_or(false)
         {
-            self.done.fetch_add(compressed, Ordering::Relaxed);
-            self.files_trusted.fetch_add(1, Ordering::Relaxed);
+            if self.action != Action::Preload {
+                self.done.fetch_add(compressed, Ordering::Relaxed);
+                self.files_trusted.fetch_add(1, Ordering::Relaxed);
+            }
             return Ok(());
         }
 
@@ -542,7 +718,18 @@ impl Run {
             None
         };
 
-        let known_ok = {
+        let known_ok = if self.action == Action::Preload {
+            self.preload_inspection
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&index)
+                .ok_or_else(|| {
+                    InstallError::InvalidData(format!(
+                        "missing preload inspection result for {}",
+                        entry.name
+                    ))
+                })?
+        } else {
             let (run, path, cancel) = (self.clone(), path.clone(), self.ctx.cancel.clone());
             tokio::task::spawn_blocking(move || {
                 let entry = &run.manifest.files[index];
@@ -563,17 +750,19 @@ impl Run {
             .filter(|(_, ok)| !**ok)
             .map(|(i, _)| i)
             .collect();
-        self.chunks_reused
-            .fetch_add((known_ok.len() - missing.len()) as u64, Ordering::Relaxed);
-        self.chunks_missing
-            .fetch_add(missing.len() as u64, Ordering::Relaxed);
-        self.bytes_missing.fetch_add(
-            missing
-                .iter()
-                .map(|&i| entry.chunks[i].compressed_len)
-                .sum(),
-            Ordering::Relaxed,
-        );
+        if self.action != Action::Preload {
+            self.chunks_reused
+                .fetch_add((known_ok.len() - missing.len()) as u64, Ordering::Relaxed);
+            self.chunks_missing
+                .fetch_add(missing.len() as u64, Ordering::Relaxed);
+            self.bytes_missing.fetch_add(
+                missing
+                    .iter()
+                    .map(|&i| entry.chunks[i].compressed_len)
+                    .sum(),
+                Ordering::Relaxed,
+            );
+        }
 
         if self.action == Action::Plan {
             return Ok(());
@@ -676,6 +865,40 @@ impl Run {
     }
 
     async fn try_chunk(&self, chunk: &Chunk, target: Option<&File>, path: &Path) -> Result<()> {
+        let raw_file = self.cache_dir().join(format!("{}.raw", chunk.name));
+        if let Some(file) = target
+            && let Ok(data) = tokio::fs::read(&raw_file).await
+        {
+            if data.len() as u64 == chunk.len && local::md5_hex(&data) == chunk.md5 {
+                let file = file
+                    .try_clone()
+                    .context(|| format!("duplicating the handle of {}", path.display()))?;
+                let (chunk_owned, path_owned) = (chunk.clone(), path.to_owned());
+
+                tokio::task::spawn_blocking(move || {
+                    local::write_at(&file, chunk_owned.offset, &data, &path_owned)
+                })
+                .await
+                .map_err(join_error)??;
+                // Keep this content-addressed raw entry until the install finishes:
+                // the same chunk can be referenced by more than one target file concurrently.
+                let done = self.done.fetch_add(chunk.compressed_len, Ordering::Relaxed)
+                    + chunk.compressed_len;
+                let total = self.progress_total.load(Ordering::Relaxed);
+
+                self.ctx.reporter.report(Progress {
+                    phase: Phase::Downloading,
+                    current: done.min(total),
+                    total,
+                    speed: self.speed.load(Ordering::Relaxed),
+                });
+
+                self.chunks_from_cache.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+
+            let _ = tokio::fs::remove_file(&raw_file).await;
+        }
         let cache_file = self.cache_dir().join(&chunk.name);
         let (compressed, cached) = match self.read_cache(&cache_file, chunk).await {
             Some(bytes) => (bytes, true),
@@ -726,10 +949,11 @@ impl Run {
         let done =
             self.done.fetch_add(chunk.compressed_len, Ordering::Relaxed) + chunk.compressed_len;
         // Between ticker beats: chunk completions keep the bar moving (throttled by the reporter).
+        let total = self.progress_total.load(Ordering::Relaxed);
         let update = Progress {
             phase: Phase::Downloading,
-            current: done.min(self.manifest.compressed_total()),
-            total: self.manifest.compressed_total(),
+            current: done.min(total),
+            total,
             speed: self.speed.load(Ordering::Relaxed),
         };
         if !cached && self.chunks_fetched.load(Ordering::Relaxed) == 0 {
@@ -757,7 +981,14 @@ impl Run {
     }
 
     async fn write_cache(&self, path: &Path, bytes: &[u8]) -> Result<()> {
-        let part = crate::fsutil::sibling(path, ".part");
+        // The same Sophon chunk can be referenced by multiple files. Those files are
+        // processed concurrently, so a shared `<chunk>.part` name races: one writer can
+        // rename it while another is still writing it. Give every writer its own sibling
+        // temporary file, then atomically publish the verified content-addressed entry.
+        let id = CACHE_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let mut temp_name = path.file_name().unwrap_or_default().to_os_string();
+        temp_name.push(format!(".{}.{}.part", std::process::id(), id));
+        let part = path.with_file_name(temp_name);
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -766,9 +997,13 @@ impl Run {
         tokio::fs::write(&part, bytes)
             .await
             .context(|| format!("writing {}", part.display()))?;
-        tokio::fs::rename(&part, path)
-            .await
-            .context(|| format!("moving {} into place", part.display()))
+        match tokio::fs::rename(&part, path).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&part).await;
+                Err(error).context(|| format!("moving {} into place", part.display()))
+            }
+        }
     }
 
     async fn finish(self: Arc<Self>, total: u64) -> Result<Outcome> {

@@ -77,6 +77,21 @@ pub(super) fn inspect_chunks(
     Ok(answers)
 }
 
+/// Read a chunk from an arbitrary installed-file location and verify its content hash.
+pub(super) fn read_matching_chunk(path: &Path, chunk: &Chunk) -> Option<Vec<u8>> {
+    if chunk.len > 256 * 1024 * 1024 {
+        return None;
+    }
+    let file = File::open(path).ok()?;
+    let file_len = file.metadata().ok()?.len();
+    if chunk.offset.saturating_add(chunk.len) > file_len {
+        return None;
+    }
+    let mut data = vec![0u8; chunk.len as usize];
+    file.read_exact_at(&mut data, chunk.offset).ok()?;
+    (md5_hex(&data) == chunk.md5).then_some(data)
+}
+
 fn region_matches(file: &File, chunk: &Chunk, buffer: &mut Vec<u8>) -> bool {
     // A manifest cannot make us allocate more than a chunk can reasonably be.
     if chunk.len > 256 * 1024 * 1024 {
