@@ -144,6 +144,11 @@ Twintail crate by git branch. It is pinned by commit (`rev` in `Cargo.toml`), co
 `codec-all` + `hash-all` and without KrDiff, and called through `HDiff::try_apply()`, so failures
 are typed errors and output is atomic. `berry-installer` therefore has exactly one git dependency.
 
+Pre-download range downloads stream to disk (`ldiff::fetch_ranges`) and report live progress: bytes are
+counted as they arrive and the smoothed network speed is published every 250 ms with the same
+`SpeedMeter` the Sophon engine uses. Before, progress was reported only when a whole range finished,
+always with speed 0, so the launcher showed 0.0 B/s for the whole pre-download.
+
 ## Adding a game (target design for phases 2-4)
 
 A game is data plus a backend id:

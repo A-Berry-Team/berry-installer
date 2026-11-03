@@ -10,7 +10,9 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use berry_patcher::{HDiff, PatchOptions};
 use md5::{Digest, Md5};
@@ -365,7 +367,6 @@ pub async fn preload_manifest(
 ) -> Result<LdiffDownloadOutcome> {
     use crate::progress::{Phase, Progress};
     use std::collections::HashSet;
-    use tokio::task::JoinSet;
 
     ctx.cancel.check()?;
     if !manifest_url.starts_with("https://") || !patch_base_url.starts_with("https://") {
@@ -400,7 +401,7 @@ pub async fn preload_manifest(
         .await
         .map_err(|e| InstallError::io(format!("publishing {}", manifest_path.display()), e))?;
 
-    let mut ranges = Vec::new();
+    let mut ranges: Vec<RangeJob> = Vec::new();
     let mut seen = HashSet::new();
     let mut bytes_reused = 0u64;
     for file in &manifest.files {
@@ -453,10 +454,20 @@ pub async fn preload_manifest(
             }
             Ok(_) => {
                 let _ = tokio::fs::remove_file(&cache_path).await;
-                ranges.push((info.patch_id.clone(), offset, length, cache_path));
+                ranges.push(RangeJob {
+                    patch_id: info.patch_id.clone(),
+                    offset,
+                    length,
+                    cache_path,
+                });
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                ranges.push((info.patch_id.clone(), offset, length, cache_path));
+                ranges.push(RangeJob {
+                    patch_id: info.patch_id.clone(),
+                    offset,
+                    length,
+                    cache_path,
+                });
             }
             Err(error) => {
                 return Err(InstallError::io(
@@ -467,7 +478,7 @@ pub async fn preload_manifest(
         }
     }
 
-    let total = ranges.iter().map(|(_, _, length, _)| *length).sum::<u64>();
+    let total = ranges.iter().map(|range| range.length).sum::<u64>();
     let patches_total = seen.len() as u64;
     let mut outcome = LdiffDownloadOutcome {
         patches_total,
@@ -478,57 +489,11 @@ pub async fn preload_manifest(
     ctx.reporter
         .report_now(Progress::new(Phase::Downloading, 0, total));
 
-    const PARALLEL_RANGES: usize = 12;
-    let mut tasks = JoinSet::new();
-    let mut completed = 0u64;
-    for (patch_id, offset, length, cache_path) in ranges {
-        ctx.cancel.check()?;
-        while tasks.len() >= PARALLEL_RANGES {
-            let result = tasks.join_next().await.ok_or_else(|| {
-                InstallError::InvalidData("LDiff download task queue ended unexpectedly".into())
-            })?;
-            let bytes = result.map_err(|e| {
-                InstallError::InvalidData(format!("LDiff download task failed: {e}"))
-            })??;
-            completed = completed.saturating_add(bytes);
-            ctx.reporter
-                .report(Progress::new(Phase::Downloading, completed, total));
-            outcome.patches_downloaded += 1;
-            outcome.bytes_downloaded = outcome.bytes_downloaded.saturating_add(bytes);
-        }
+    let (patches_downloaded, bytes_downloaded) =
+        fetch_ranges(http, patch_base_url, ranges, total, ctx).await?;
+    outcome.patches_downloaded = patches_downloaded;
+    outcome.bytes_downloaded = bytes_downloaded;
 
-        let http = http.clone();
-        let cancel = ctx.cancel.clone();
-        let base = patch_base_url.trim_end_matches('/').to_owned();
-        tasks.spawn(async move {
-            let url = format!("{base}/{patch_id}");
-            let bytes = http.get_range(&url, offset, length, &cancel).await?;
-            if bytes.len() as u64 != length {
-                return Err(InstallError::InvalidData(format!(
-                    "{url}: received {} bytes, expected {length}",
-                    bytes.len()
-                )));
-            }
-            let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
-            let temp = cache_path.with_extension(format!("part-{id}"));
-            tokio::fs::write(&temp, &bytes)
-                .await
-                .map_err(|e| InstallError::io(format!("writing {}", temp.display()), e))?;
-            tokio::fs::rename(&temp, &cache_path)
-                .await
-                .map_err(|e| InstallError::io(format!("publishing {}", cache_path.display()), e))?;
-            Ok::<u64, InstallError>(length)
-        });
-    }
-    while let Some(result) = tasks.join_next().await {
-        let bytes = result
-            .map_err(|e| InstallError::InvalidData(format!("LDiff download task failed: {e}")))??;
-        completed = completed.saturating_add(bytes);
-        ctx.reporter
-            .report(Progress::new(Phase::Downloading, completed, total));
-        outcome.patches_downloaded += 1;
-        outcome.bytes_downloaded = outcome.bytes_downloaded.saturating_add(bytes);
-    }
     ctx.reporter
         .report_now(Progress::new(Phase::Downloading, total, total));
     ctx.reporter.report_now(Progress::new(
@@ -537,6 +502,201 @@ pub async fn preload_manifest(
         patches_total,
     ));
     Ok(outcome)
+}
+
+/// One HTTP range of a shared patch resource that must end up in the preload cache.
+struct RangeJob {
+    patch_id: String,
+    offset: u64,
+    length: u64,
+    cache_path: PathBuf,
+}
+
+/// Aborts a spawned task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Ranges downloaded at the same time.
+const PARALLEL_RANGES: usize = 12;
+/// How often the network speed and the byte counter are published.
+const PROGRESS_TICK: Duration = Duration::from_millis(250);
+
+/// Download every range into the preload cache and return `(ranges, bytes)` stored.
+///
+/// Progress is live: bytes are counted as they arrive instead of when a whole range finishes, and
+/// the smoothed network speed is published every [`PROGRESS_TICK`] (the same meter the Sophon engine
+/// uses). Reporting only on completion, with a speed of zero, is what made the UI show "0.0 B/s"
+/// for the whole pre-download, since a range can be many megabytes.
+async fn fetch_ranges(
+    http: &crate::http::Http,
+    patch_base_url: &str,
+    ranges: Vec<RangeJob>,
+    total: u64,
+    ctx: &crate::progress::JobContext,
+) -> Result<(u64, u64)> {
+    use crate::progress::{Phase, Progress, SpeedMeter};
+    use tokio::task::JoinSet;
+
+    // `net` counts every byte received (retries included) and drives the speed; `done` counts the
+    // bytes that belong to the ranges and drives the progress bar.
+    let net = Arc::new(AtomicU64::new(0));
+    let done = Arc::new(AtomicU64::new(0));
+
+    // Stops with this function, including when the caller drops the whole download (a cancel).
+    let _ticker = {
+        let (net, done) = (net.clone(), done.clone());
+        let reporter = ctx.reporter.clone();
+        AbortOnDrop(tokio::spawn(async move {
+            let mut meter = SpeedMeter::new();
+            let mut last_net = 0u64;
+            loop {
+                tokio::time::sleep(PROGRESS_TICK).await;
+                let received = net.load(Ordering::Relaxed);
+                let speed = meter.add(received.saturating_sub(last_net));
+                last_net = received;
+                reporter.report(Progress {
+                    phase: Phase::Downloading,
+                    current: done.load(Ordering::Relaxed).min(total),
+                    total,
+                    speed,
+                });
+            }
+        }))
+    };
+
+    let base = patch_base_url.trim_end_matches('/').to_owned();
+    async {
+        let mut tasks: JoinSet<Result<u64>> = JoinSet::new();
+        let mut count = 0u64;
+        let mut bytes = 0u64;
+        let mut collect = |joined: std::result::Result<Result<u64>, tokio::task::JoinError>| {
+            let length = joined.map_err(|e| {
+                InstallError::InvalidData(format!("LDiff download task failed: {e}"))
+            })??;
+            count += 1;
+            bytes = bytes.saturating_add(length);
+            Ok::<(), InstallError>(())
+        };
+        for range in ranges {
+            ctx.cancel.check()?;
+            while tasks.len() >= PARALLEL_RANGES {
+                let joined = tasks.join_next().await.ok_or_else(|| {
+                    InstallError::InvalidData("LDiff download task queue ended unexpectedly".into())
+                })?;
+                collect(joined)?;
+            }
+            let url = format!("{base}/{}", range.patch_id);
+            tasks.spawn(fetch_range(
+                http.clone(),
+                url,
+                range,
+                net.clone(),
+                done.clone(),
+                ctx.cancel.clone(),
+            ));
+        }
+        while let Some(joined) = tasks.join_next().await {
+            collect(joined)?;
+        }
+        Ok::<(u64, u64), InstallError>((count, bytes))
+    }
+    .await
+}
+
+/// Fetch one range, streaming it to a temporary file that is published atomically once complete.
+async fn fetch_range(
+    http: crate::http::Http,
+    url: String,
+    range: RangeJob,
+    net: Arc<AtomicU64>,
+    done: Arc<AtomicU64>,
+    cancel: crate::progress::CancelToken,
+) -> Result<u64> {
+    let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let temp = range.cache_path.with_extension(format!("part-{id}"));
+    let stored = crate::http::retry(&cancel, || async {
+        let mut counted = 0u64;
+        let attempt = stream_range(
+            &http,
+            &url,
+            &range,
+            &temp,
+            &net,
+            &done,
+            &mut counted,
+            &cancel,
+        )
+        .await;
+        if attempt.is_err() {
+            // The next attempt starts the range over: forget what this one had contributed.
+            done.fetch_sub(counted, Ordering::Relaxed);
+        }
+        attempt
+    })
+    .await;
+    let published = match stored {
+        Ok(()) => tokio::fs::rename(&temp, &range.cache_path)
+            .await
+            .map_err(|e| InstallError::io(format!("publishing {}", range.cache_path.display()), e)),
+        Err(error) => Err(error),
+    };
+    if published.is_err() {
+        let _ = tokio::fs::remove_file(&temp).await;
+    }
+    published.map(|()| range.length)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_range(
+    http: &crate::http::Http,
+    url: &str,
+    range: &RangeJob,
+    temp: &Path,
+    net: &AtomicU64,
+    done: &AtomicU64,
+    counted: &mut u64,
+    cancel: &crate::progress::CancelToken,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut response = http
+        .open_range(url, range.offset, range.length, cancel)
+        .await?;
+    let file = tokio::fs::File::create(temp)
+        .await
+        .map_err(|e| InstallError::io(format!("creating {}", temp.display()), e))?;
+    let mut out = tokio::io::BufWriter::with_capacity(256 * 1024, file);
+    while let Some(chunk) = response.chunk().await? {
+        cancel.check()?;
+        let len = chunk.len() as u64;
+        if counted.saturating_add(len) > range.length {
+            return Err(InstallError::InvalidData(format!(
+                "{url}: the server sent more than the {} requested bytes",
+                range.length
+            )));
+        }
+        out.write_all(&chunk)
+            .await
+            .map_err(|e| InstallError::io(format!("writing {}", temp.display()), e))?;
+        *counted += len;
+        net.fetch_add(len, Ordering::Relaxed);
+        done.fetch_add(len, Ordering::Relaxed);
+    }
+    out.flush()
+        .await
+        .map_err(|e| InstallError::io(format!("writing {}", temp.display()), e))?;
+    if *counted != range.length {
+        return Err(InstallError::Network(format!(
+            "{url}: received {} of {} bytes",
+            *counted, range.length
+        )));
+    }
+    Ok(())
 }
 
 /// Apply a previously downloaded LDiff preload. Every patch range is read from the persistent
@@ -703,43 +863,274 @@ pub fn apply_cached_manifest_for_url(
     apply_cached_manifest(game_dir, &cache_dir, &manifest, from_version)
 }
 
-/// Whether a completed LDiff preload is available for a later update.
-/// The manifest is published only after it has been fully written; the corresponding
-/// patch ranges are individually published after their downloads complete.
-pub fn has_cached_preload(game_dir: &Path) -> bool {
-    game_dir
-        .join(".berry-preload")
-        .join("ldiff")
-        .join(".complete")
-        .is_file()
+/// Game-level marker of a finished pre-download. It holds the version the pre-download targets,
+/// so a cache that is complete for one version is never mistaken for the next one.
+const PRELOAD_VERSION_MARKER: &str = "complete-version";
+
+fn preload_root(game_dir: &Path) -> std::path::PathBuf {
+    game_dir.join(crate::sophon::engine::PRELOAD_DIR)
 }
 
-/// Mark the LDiff preload as complete only after every preload job has succeeded.
-pub fn mark_preload_complete(game_dir: &Path) -> Result<()> {
-    let cache_dir = game_dir.join(".berry-preload").join("ldiff");
-    if !cache_dir.is_dir() {
-        return Ok(());
-    }
-    let marker = cache_dir.join(".complete");
-    let temp = cache_dir.join(format!(
-        ".complete-{}.part",
+/// Version of the completed pre-download waiting in the cache, if there is one.
+///
+/// The marker is written only after every preload job (game data and voice packs, LDiff or
+/// Sophon) has succeeded, and removed as soon as another pre-download starts or the game is
+/// updated.
+pub fn cached_preload_version(game_dir: &Path) -> Option<String> {
+    let text = fs::read_to_string(preload_root(game_dir).join(PRELOAD_VERSION_MARKER)).ok()?;
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
+/// Whether a completed pre-download is available for a later update.
+pub fn has_cached_preload(game_dir: &Path) -> bool {
+    cached_preload_version(game_dir).is_some()
+}
+
+/// Record that the pre-download of `version` is complete. Call only after every job succeeded.
+pub fn mark_preload_complete(game_dir: &Path, version: &str) -> Result<()> {
+    let root = preload_root(game_dir);
+    fs::create_dir_all(&root).context(|| format!("creating {}", root.display()))?;
+    let marker = root.join(PRELOAD_VERSION_MARKER);
+    let temp = root.join(format!(
+        ".{PRELOAD_VERSION_MARKER}-{}.part",
         TEMP_ID.fetch_add(1, Ordering::Relaxed)
     ));
-    fs::write(&temp, b"berry-ldiff-preload-v1")
-        .context(|| format!("writing {}", temp.display()))?;
+    fs::write(&temp, version.as_bytes()).context(|| format!("writing {}", temp.display()))?;
     fs::rename(&temp, &marker).context(|| format!("publishing {}", marker.display()))?;
     Ok(())
 }
 
-/// Remove the cached LDiff manifest and patch ranges after a successful live update.
+/// Called when a pre-download of `version` starts: the previous "complete" marker no longer
+/// describes the cache. Patch ranges cached for a different target version can never be applied
+/// again, so they are dropped instead of piling up next to the new ones.
+pub fn begin_preload(game_dir: &Path, version: &str) -> Result<()> {
+    let root = preload_root(game_dir);
+    let target = root.join("target-version");
+    let previous = fs::read_to_string(&target).ok();
+    if previous.is_some_and(|previous| previous.trim() != version) {
+        clear_preload_cache(game_dir)?;
+    }
+    fs::create_dir_all(&root).context(|| format!("creating {}", root.display()))?;
+    match fs::remove_file(root.join(PRELOAD_VERSION_MARKER)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(InstallError::io(
+                format!("removing the pre-download marker in {}", root.display()),
+                error,
+            ));
+        }
+    }
+    fs::write(&target, version.as_bytes()).context(|| format!("writing {}", target.display()))?;
+    Ok(())
+}
+
+/// Remove every cached pre-download (LDiff patch ranges, Sophon chunks, markers) once the game
+/// has been updated: the cache belongs to a version that is now installed, so it must not keep
+/// hiding the button of the next pre-download.
 pub fn clear_preload_cache(game_dir: &Path) -> Result<()> {
-    let cache_dir = game_dir.join(".berry-preload").join("ldiff");
-    match fs::remove_dir_all(&cache_dir) {
+    let root = preload_root(game_dir);
+    match fs::remove_dir_all(&root) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(InstallError::io(
-            format!("removing {}", cache_dir.display()),
+            format!("removing {}", root.display()),
             error,
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preload_marker_follows_the_pre_download_life_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let game = dir.path();
+        assert_eq!(cached_preload_version(game), None);
+
+        // Pre-download of 7.2.0 starts, finishes, and hides the button.
+        begin_preload(game, "7.2.0").unwrap();
+        assert!(!has_cached_preload(game));
+        mark_preload_complete(game, "7.2.0").unwrap();
+        assert_eq!(cached_preload_version(game).as_deref(), Some("7.2.0"));
+
+        // The update is applied: the cache is gone, so a later pre-download shows again.
+        clear_preload_cache(game).unwrap();
+        assert_eq!(cached_preload_version(game), None);
+        clear_preload_cache(game).unwrap();
+    }
+
+    #[test]
+    fn a_new_preload_invalidates_the_previous_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let game = dir.path();
+        begin_preload(game, "7.2.0").unwrap();
+        mark_preload_complete(game, "7.2.0").unwrap();
+        let stale = preload_root(game).join("ldiff");
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("old.hdiff"), b"x").unwrap();
+
+        // 7.3.0 starts: 7.2.0 is no longer "complete" and its leftovers are dropped.
+        begin_preload(game, "7.3.0").unwrap();
+        assert_eq!(cached_preload_version(game), None);
+        assert!(!stale.join("old.hdiff").exists());
+
+        // Resuming the same version keeps what was downloaded.
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("part.hdiff"), b"x").unwrap();
+        begin_preload(game, "7.3.0").unwrap();
+        assert!(stale.join("part.hdiff").exists());
+    }
+    use crate::http::Http;
+    use crate::progress::{JobContext, Phase, Progress};
+    use std::io::{BufRead, BufReader};
+    use std::net::TcpListener;
+    use std::sync::Mutex;
+
+    /// Serves `blob` over HTTP/1.1 with `Range` support, writing every response slowly so that a
+    /// transfer lasts long enough for the progress ticker to observe it mid-flight.
+    fn serve_slowly(blob: Vec<u8>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let blob = blob.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut range = None;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                            break;
+                        }
+                        if let Some(value) = line.to_ascii_lowercase().strip_prefix("range: bytes=")
+                        {
+                            let (from, to) = value.trim().split_once('-').unwrap();
+                            range = Some((
+                                from.parse::<usize>().unwrap(),
+                                to.parse::<usize>().unwrap(),
+                            ));
+                        }
+                    }
+                    let Some((from, to)) = range else { return };
+                    let body = &blob[from..=to];
+                    let head = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {from}-{to}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        blob.len(),
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    for piece in body.chunks(8 * 1024) {
+                        if stream.write_all(piece).is_err() {
+                            return;
+                        }
+                        let _ = stream.flush();
+                        std::thread::sleep(Duration::from_millis(60));
+                    }
+                });
+            }
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn range_download_reports_live_bytes_and_speed() {
+        const RANGE: usize = 64 * 1024;
+        let blob: Vec<u8> = (0..RANGE * 4).map(|i| (i % 251) as u8).collect();
+        let base = serve_slowly(blob.clone());
+        let dir = tempfile::tempdir().unwrap();
+
+        let ranges: Vec<RangeJob> = (0..3)
+            .map(|i| RangeJob {
+                patch_id: "bundle".into(),
+                offset: (i * RANGE) as u64,
+                length: RANGE as u64,
+                cache_path: dir.path().join(format!("bundle-{i}.hdiff")),
+            })
+            .collect();
+        let total = (3 * RANGE) as u64;
+
+        let seen: Arc<Mutex<Vec<Progress>>> = Arc::default();
+        let sink = seen.clone();
+        let ctx = JobContext::new().with_progress(move |p| sink.lock().unwrap().push(p));
+
+        let http = Http::new("berry-installer-test").unwrap();
+        let (count, bytes) = fetch_ranges(&http, &base, ranges, total, &ctx)
+            .await
+            .unwrap();
+        assert_eq!((count, bytes), (3, total));
+
+        for i in 0..3 {
+            let stored = std::fs::read(dir.path().join(format!("bundle-{i}.hdiff"))).unwrap();
+            assert_eq!(stored, blob[i * RANGE..(i + 1) * RANGE]);
+        }
+        // No temporary file is left behind.
+        let leftovers = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".part-")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
+
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter()
+                .all(|p| p.phase == Phase::Downloading && p.total == total),
+            "{seen:?}"
+        );
+        // Mid-transfer: some bytes counted before any range finished, and a non-zero speed.
+        assert!(
+            seen.iter().any(|p| p.current > 0 && p.current < total),
+            "progress only moved on completion: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|p| p.speed > 0),
+            "the network speed stayed at zero: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_range_that_comes_back_short_is_retried_not_stored() {
+        // A server that closes the connection halfway through a range must never leave a short
+        // file in the cache under the final name.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                        break;
+                    }
+                }
+                let _ = stream.write_all(
+                    b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-1023/4096\r\nContent-Length: 1024\r\nConnection: close\r\n\r\nshort",
+                );
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("bundle-0.hdiff");
+        let ranges = vec![RangeJob {
+            patch_id: "bundle".into(),
+            offset: 0,
+            length: 1024,
+            cache_path: final_path.clone(),
+        }];
+        let http = Http::new("berry-installer-test").unwrap();
+        let ctx = JobContext::new();
+        let result = fetch_ranges(&http, &format!("http://{address}"), ranges, 1024, &ctx).await;
+        assert!(result.is_err());
+        assert!(!final_path.exists());
     }
 }
