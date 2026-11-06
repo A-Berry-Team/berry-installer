@@ -1,20 +1,11 @@
-//! Small add-on packages the launcher fetches next to the games (BerryUnlock, jadeite...).
+//! Small add-on packages the launcher fetches next to the games (BerryUnlock).
 //!
-//! They are described by JSON manifests published by the Twintail project
-//! (`<manifest base>/<package id>.json`); only that *data* is shared, no code. A manifest lists
-//! packages in one of two download modes:
+//! Packages are published as GitHub releases: [`ExtrasManager::ensure_github`] asks the GitHub API
+//! for the latest release of a repository, picks one asset by name and installs it.
 //!
-//! * `DOWNLOAD_MODE_FILE`: one file (`git_url`), optionally an archive to unpack;
-//! * `DOWNLOAD_MODE_RAW`: a list of files under `raw_url`.
-//!
-//! Compared with the fischl-rs version: the result is tracked with a marker (so a startup prefetch
-//! costs one tiny request instead of a download), an installed package keeps working when the
-//! manifest server is unreachable, archives are unpacked with [`crate::archive`], and every
-//! download goes through the resumable [`crate::download`].
-//!
-//! Packages that are published as GitHub releases (BerryUnlock) use [`ExtrasManager::ensure_github`]
-//! instead: it asks the GitHub API for the latest release of a repository, picks one asset by name
-//! and installs it with the very same marker / offline / archive handling.
+//! The result is tracked with a marker (so a startup prefetch costs one tiny request instead of a
+//! download), an installed package keeps working when GitHub is unreachable, archives are unpacked
+//! with [`crate::archive`], and every download goes through the resumable [`crate::download`].
 
 use std::path::{Path, PathBuf};
 
@@ -29,38 +20,16 @@ use crate::http::Http;
 use crate::progress::JobContext;
 use crate::state::{Marker, state_of};
 
-pub const DEFAULT_MANIFEST_BASE: &str =
-    "https://dl-public.twintaillauncher.app/launcher_app/manifests";
-
 pub const DEFAULT_GITHUB_API_BASE: &str = "https://api.github.com";
 
-#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
-#[serde(default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Package {
     pub package_name: String,
     pub version: String,
-    pub default_download_mode: String,
-    /// `DOWNLOAD_MODE_FILE`: where the file lives.
+    /// Where the file lives.
     pub git_url: String,
     pub zip_sha256: String,
     pub size: u64,
-    /// `DOWNLOAD_MODE_RAW`: base URL and the files below it (`dir/` entries are directories).
-    pub raw_url: String,
-    pub file_list: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(default)]
-struct Manifest {
-    retcode: i32,
-    message: String,
-    data: Option<ManifestData>,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(default)]
-struct ManifestData {
-    packages: Vec<Package>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -92,15 +61,6 @@ pub struct GithubRef<'a> {
     pub asset: &'a str,
 }
 
-/// Which package of which manifest.
-#[derive(Debug, Clone, Copy)]
-pub struct ExtraRef<'a> {
-    /// Manifest name (`jadeite`).
-    pub id: &'a str,
-    /// Which package inside the manifest, matched loosely (`jadeite`).
-    pub kind: &'a str,
-}
-
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ExtraOptions {
     /// Unpack the downloaded file when it is an archive (bare executables are left alone) and
@@ -113,14 +73,13 @@ pub struct ExtraOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledExtra {
     pub version: String,
-    /// `false` when it was already up to date (or the manifest was unreachable).
+    /// `false` when it was already up to date (or GitHub was unreachable).
     pub changed: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct ExtrasManager {
     http: Http,
-    manifest_base: String,
     github_api_base: String,
     enforce_checksums: bool,
 }
@@ -133,26 +92,6 @@ fn normalize(value: &str) -> String {
         .filter(|c| c.is_ascii_alphanumeric())
         .map(|c| c.to_ascii_lowercase())
         .collect()
-}
-
-/// Tolerant package lookup: by `kind`, then by manifest id, then the only package there is.
-pub fn pick_package<'a>(packages: &'a [Package], wanted: ExtraRef<'_>) -> Option<&'a Package> {
-    let (kind, id) = (normalize(wanted.kind), normalize(wanted.id));
-    packages
-        .iter()
-        .find(|p| normalize(&p.package_name).contains(&kind))
-        .or_else(|| {
-            packages
-                .iter()
-                .find(|p| normalize(&p.package_name).contains(&id))
-        })
-        .or_else(|| {
-            if packages.len() == 1 {
-                packages.first()
-            } else {
-                None
-            }
-        })
 }
 
 /// Asset lookup: exact (normalized) name first, then any asset that contains the wanted name
@@ -181,15 +120,9 @@ impl ExtrasManager {
     pub fn new(http: Http) -> Self {
         Self {
             http,
-            manifest_base: DEFAULT_MANIFEST_BASE.into(),
             github_api_base: DEFAULT_GITHUB_API_BASE.into(),
             enforce_checksums: false,
         }
-    }
-
-    pub fn with_manifest_base(mut self, base: impl Into<String>) -> Self {
-        self.manifest_base = base.into().trim_end_matches('/').to_owned();
-        self
     }
 
     pub fn with_github_api_base(mut self, base: impl Into<String>) -> Self {
@@ -197,9 +130,9 @@ impl ExtrasManager {
         self
     }
 
-    /// Fail (instead of just warn) when a downloaded file does not match the manifest's
-    /// `zip_sha256`. Off by default: the field's exact semantics for non-zip files has not been
-    /// confirmed against the live manifests, and a wrong guess must not break the FPS unlocker.
+    /// Fail (instead of just warn) when a downloaded file does not match the release's
+    /// `sha256` digest. Off by default: the field's exact semantics for non-zip files has not been
+    /// confirmed against the live releases, and a wrong guess must not break the FPS unlocker.
     pub fn enforce_checksums(mut self, enforce: bool) -> Self {
         self.enforce_checksums = enforce;
         self
@@ -210,85 +143,6 @@ impl ExtrasManager {
         state_of(dest, &marker_name(id))
             .version()
             .map(str::to_owned)
-    }
-
-    pub async fn fetch_package(&self, wanted: ExtraRef<'_>, ctx: &JobContext) -> Result<Package> {
-        if wanted.id.is_empty() {
-            return Err(InstallError::InvalidData("empty package id".into()));
-        }
-        let url = format!("{}/{}.json", self.manifest_base, wanted.id);
-        let body = self.http.get_text(&url, &ctx.cancel).await?;
-        let manifest: Manifest = serde_json::from_str(&body).map_err(|e| {
-            let start: String = body.chars().take(120).collect();
-            InstallError::InvalidData(format!(
-                "{url} is not a valid manifest ({e}); starts with {start:?}"
-            ))
-        })?;
-        if manifest.retcode != 0 {
-            return Err(InstallError::InvalidData(format!(
-                "manifest '{}' reports retcode {} ({})",
-                wanted.id, manifest.retcode, manifest.message
-            )));
-        }
-        let data = manifest.data.ok_or_else(|| {
-            InstallError::InvalidData(format!(
-                "manifest '{}' has no data ({})",
-                wanted.id, manifest.message
-            ))
-        })?;
-        pick_package(&data.packages, wanted)
-            .cloned()
-            .ok_or_else(|| {
-                let names: Vec<&str> = data
-                    .packages
-                    .iter()
-                    .map(|p| p.package_name.as_str())
-                    .collect();
-                InstallError::InvalidData(format!(
-                    "manifest '{}' has no package matching '{}' (available: {})",
-                    wanted.id,
-                    wanted.kind,
-                    names.join(", ")
-                ))
-            })
-    }
-
-    /// Make sure the package is in `dest` at the manifest's current version.
-    ///
-    /// Already installed and the manifest cannot be reached: succeeds with `changed = false`, so
-    /// an offline start never breaks something that was working.
-    pub async fn ensure(
-        &self,
-        wanted: ExtraRef<'_>,
-        dest: &Path,
-        options: ExtraOptions,
-        ctx: &JobContext,
-    ) -> Result<InstalledExtra> {
-        let installed = Self::installed_version(dest, wanted.id);
-        let package = match self.fetch_package(wanted, ctx).await {
-            Ok(package) => package,
-            Err(error) if !error.is_cancelled() => match installed {
-                Some(version) => {
-                    tracing::warn!(
-                        "[extras] {}: manifest unavailable ({error}); keeping {version}",
-                        wanted.id
-                    );
-                    return Ok(InstalledExtra {
-                        version,
-                        changed: false,
-                    });
-                }
-                None => return Err(error),
-            },
-            Err(error) => return Err(error),
-        };
-        if installed.as_deref() == Some(package.version.as_str()) {
-            return Ok(InstalledExtra {
-                version: package.version,
-                changed: false,
-            });
-        }
-        self.install(wanted, &package, dest, options, ctx).await
     }
 
     /// Latest published release of `repo`. `releases/latest` ignores pre-releases, so a project
@@ -356,15 +210,13 @@ impl ExtrasManager {
         Ok(Package {
             package_name: asset.name.clone(),
             version: release.tag_name.clone(),
-            default_download_mode: "DOWNLOAD_MODE_FILE".into(),
             git_url: asset.browser_download_url.clone(),
             zip_sha256: digest,
             size: asset.size,
-            ..Package::default()
         })
     }
 
-    /// Like [`ensure`](Self::ensure), for an asset of the latest GitHub release of a repository.
+    /// Make sure the asset of the latest GitHub release of a repository is in `dest`.
     /// The release tag is the installed version; offline with a copy installed still succeeds.
     pub async fn ensure_github(
         &self,
@@ -397,16 +249,12 @@ impl ExtrasManager {
                 changed: false,
             });
         }
-        let as_extra = ExtraRef {
-            id: wanted.id,
-            kind: wanted.asset,
-        };
-        self.install(as_extra, &package, dest, options, ctx).await
+        self.install(wanted.id, &package, dest, options, ctx).await
     }
 
     async fn install(
         &self,
-        wanted: ExtraRef<'_>,
+        id: &str,
         package: &Package,
         dest: &Path,
         options: ExtraOptions,
@@ -414,23 +262,14 @@ impl ExtrasManager {
     ) -> Result<InstalledExtra> {
         std::fs::create_dir_all(dest).context(|| format!("creating {}", dest.display()))?;
         // From here the old version is being replaced: it must not look ready if we die midway.
-        crate::state::clear_marker(dest, &marker_name(wanted.id))?;
+        crate::state::clear_marker(dest, &marker_name(id))?;
 
-        match package.default_download_mode.as_str() {
-            "DOWNLOAD_MODE_FILE" => self.install_file(package, dest, options, ctx).await?,
-            "DOWNLOAD_MODE_RAW" => self.install_raw(package, dest, ctx).await?,
-            other => {
-                return Err(InstallError::InvalidData(format!(
-                    "package '{}' uses an unsupported download mode '{other}'",
-                    package.package_name
-                )));
-            }
-        }
+        self.install_file(package, dest, options, ctx).await?;
 
-        Marker::now(Some(package.version.clone())).write(&dest.join(marker_name(wanted.id)))?;
+        Marker::now(Some(package.version.clone())).write(&dest.join(marker_name(id)))?;
         tracing::info!(
             "[extras] {} {} installed in {}",
-            wanted.id,
+            id,
             package.version,
             dest.display()
         );
@@ -490,31 +329,6 @@ impl ExtrasManager {
         Ok(())
     }
 
-    async fn install_raw(&self, package: &Package, dest: &Path, ctx: &JobContext) -> Result<()> {
-        if package.file_list.is_empty() {
-            return Err(InstallError::InvalidData(format!(
-                "package '{}' has an empty file list",
-                package.package_name
-            )));
-        }
-        let base = package.raw_url.trim_end_matches('/');
-        for entry in &package.file_list {
-            let relative = safe_relative(entry.trim_end_matches('/'))?;
-            if entry.ends_with('/') {
-                std::fs::create_dir_all(dest.join(&relative))
-                    .context(|| format!("creating {}", relative.display()))?;
-            } else {
-                download_file(
-                    &self.http,
-                    &DownloadSpec::new(format!("{base}/{entry}"), dest.join(&relative)),
-                    ctx,
-                )
-                .await?;
-            }
-        }
-        Ok(())
-    }
-
     async fn check_checksum(&self, package: &Package, file: &Path, ctx: &JobContext) -> Result<()> {
         let Ok(expected) = Checksum::sha256(&package.zip_sha256) else {
             return Ok(());
@@ -541,7 +355,7 @@ impl ExtrasManager {
     }
 }
 
-/// Manifest data decides file names; never let it write outside the destination.
+/// Release data decides file names; never let it write outside the destination.
 fn safe_relative(value: &str) -> Result<PathBuf> {
     let path = PathBuf::from(value);
     let ok = !value.is_empty()
@@ -555,7 +369,7 @@ fn safe_relative(value: &str) -> Result<PathBuf> {
         Ok(path)
     } else {
         Err(InstallError::InvalidData(format!(
-            "unsafe path in manifest: {value:?}"
+            "unsafe path in release: {value:?}"
         )))
     }
 }

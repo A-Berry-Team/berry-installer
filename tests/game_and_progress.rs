@@ -8,7 +8,7 @@ use berry_installer::game::{
     installed_version, unfinished_work, write_version,
 };
 use berry_installer::{
-    CancelToken, GameState, InstallError, JobContext, Phase, Progress, Reporter,
+    CancelToken, GameState, InstallError, JobContext, PatchStep, Phase, Progress, Reporter,
 };
 
 #[test]
@@ -90,11 +90,13 @@ fn progress_fraction_is_clamped_and_safe_without_a_total() {
 }
 
 #[test]
-fn phases_are_ordered_and_only_finalizing_is_critical() {
+fn phases_are_ordered_and_only_the_point_of_no_return_is_critical() {
     assert!(Phase::Resolving < Phase::Downloading);
     assert!(Phase::Verifying < Phase::Extracting);
-    assert!(Phase::Extracting < Phase::Finalizing);
+    assert!(Phase::Extracting < Phase::Patching);
+    assert!(Phase::Patching < Phase::Finalizing);
     assert!(Phase::Finalizing.is_critical());
+    assert!(Phase::Patching.is_critical());
     assert!(!Phase::Extracting.is_critical());
 }
 
@@ -191,4 +193,32 @@ fn only_network_trouble_and_retryable_statuses_are_transient() {
     assert!(!status(404).is_transient());
     assert!(!InstallError::Cancelled.is_transient());
     assert!(InstallError::Cancelled.is_cancelled());
+}
+
+#[test]
+fn patch_steps_reach_their_sink_whatever_the_builder_order() {
+    let step = PatchStep {
+        index: 3,
+        total: 9,
+        bytes: 1024,
+        done_bytes: 2048,
+        total_bytes: 9000,
+    };
+    let seen: Arc<Mutex<Vec<PatchStep>>> = Arc::default();
+
+    let sink = seen.clone();
+    let patch_first = JobContext::new()
+        .with_patch_progress(move |step| sink.lock().unwrap().push(step))
+        .with_progress(|_| {});
+    patch_first.reporter.patch(step);
+
+    let sink = seen.clone();
+    let progress_first = JobContext::new()
+        .with_progress(|_| {})
+        .with_patch_progress(move |step| sink.lock().unwrap().push(step));
+    progress_first.reporter.patch(step);
+
+    assert_eq!(*seen.lock().unwrap(), vec![step, step]);
+    // Without a patch sink announcing a patch is a no-op.
+    JobContext::new().reporter.patch(step);
 }

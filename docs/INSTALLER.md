@@ -58,12 +58,12 @@ Rules the toolbox enforces for every manager and backend:
 ## Roadmap
 
 ### Phase 2 -- extras and game state (done)
-* `extras::ExtrasManager` replaces fischl-rs' `Extras` (jadeite from Twintail manifests; BerryUnlock from the latest GitHub release of `A-Berry-Team/berry-unlock` via `ensure_github`). Same Twintail
-  manifest data, new behaviour: a marker per package (`.berry-extra-<id>`) so the startup prefetch
-  costs one small request instead of a download; an installed package keeps working when the
-  manifest server is down; archives are unpacked with `archive` and merged into the (shared)
-  destination without touching other files; manifest paths cannot escape the destination.
-  Checksums (`zip_sha256`) are verified but only *warn* by default (`enforce_checksums(true)` makes
+* `extras::ExtrasManager` replaces fischl-rs' `Extras` (BerryUnlock from the latest GitHub release of `A-Berry-Team/berry-unlock` via `ensure_github`). The Twintail
+  manifest client was removed (no consumers). Behaviour: a marker per package (`.berry-extra-<id>`) so the startup prefetch
+  costs one small request instead of a download; an installed package keeps working when
+  GitHub is down; archives are unpacked with `archive` and merged into the (shared)
+  destination without touching other files; release asset names cannot escape the destination.
+  Checksums (the release `sha256` digest) are verified but only *warn* by default (`enforce_checksums(true)` makes
   them fatal): the field could not be checked against the live manifests from the dev sandbox, and
   a wrong guess must not break the FPS unlocker. Flip it once confirmed.
 * `game::{GameState, inspect, ...}` is the single definition of a game directory's state:

@@ -18,6 +18,11 @@ pub enum Phase {
     /// Hashing downloaded data.
     Verifying,
     Extracting,
+    /// Applying downloaded HDiff / LDiff patches over the installed files. Local disk work, not a
+    /// transfer: it cannot be paused and stopping it half way leaves files of two versions side
+    /// by side. [`Progress`] counts patched bytes here and [`Reporter::patch`] announces every
+    /// single patch.
+    Patching,
     /// Moving the finished result into place. Stopping here would leave things half applied, so
     /// callers should treat it as the point of no return (see [`Phase::is_critical`]).
     Finalizing,
@@ -25,7 +30,7 @@ pub enum Phase {
 
 impl Phase {
     pub fn is_critical(self) -> bool {
-        self == Phase::Finalizing
+        matches!(self, Phase::Patching | Phase::Finalizing)
     }
 }
 
@@ -58,6 +63,20 @@ impl Progress {
             (self.current as f64 / self.total as f64).min(1.0)
         }
     }
+}
+
+/// One patch of a [`Phase::Patching`] run, announced right before it is applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PatchStep {
+    /// 1-based position of the patch among the ones to apply.
+    pub index: u32,
+    pub total: u32,
+    /// Size in bytes of the file this patch produces; what the patch weighs in the run.
+    pub bytes: u64,
+    /// Bytes of the patches announced before this one.
+    pub done_bytes: u64,
+    /// Bytes of every patch of the run.
+    pub total_bytes: u64,
 }
 
 /// Cheap, cloneable stop flag. Backed by an `Arc<AtomicBool>` so the launcher can keep using the
@@ -111,11 +130,13 @@ impl CancelToken {
 }
 
 type Sink = dyn Fn(Progress) + Send + Sync;
+type PatchSink = dyn Fn(PatchStep) + Send + Sync;
 
 /// Delivers progress to a callback, at most ~10 times per second unless forced.
 #[derive(Clone, Default)]
 pub struct Reporter {
     sink: Option<Arc<Sink>>,
+    patch_sink: Option<Arc<PatchSink>>,
     last: Arc<Mutex<Option<Instant>>>,
 }
 
@@ -125,7 +146,21 @@ impl Reporter {
     pub fn new(sink: impl Fn(Progress) + Send + Sync + 'static) -> Self {
         Self {
             sink: Some(Arc::new(sink)),
+            patch_sink: None,
             last: Arc::default(),
+        }
+    }
+
+    /// Also deliver [`PatchStep`]s to `sink`.
+    pub fn with_patch_sink(mut self, sink: impl Fn(PatchStep) + Send + Sync + 'static) -> Self {
+        self.patch_sink = Some(Arc::new(sink));
+        self
+    }
+
+    /// Announce the patch that is about to be applied. Never throttled: there is one per file.
+    pub fn patch(&self, step: PatchStep) {
+        if let Some(sink) = &self.patch_sink {
+            sink(step);
         }
     }
 
@@ -177,7 +212,16 @@ impl JobContext {
     }
 
     pub fn with_progress(mut self, sink: impl Fn(Progress) + Send + Sync + 'static) -> Self {
+        // Keep a patch sink attached earlier: the order of the builders must not matter.
+        let patch_sink = self.reporter.patch_sink.take();
         self.reporter = Reporter::new(sink);
+        self.reporter.patch_sink = patch_sink;
+        self
+    }
+
+    /// Receive one [`PatchStep`] per patch while patches are applied.
+    pub fn with_patch_progress(mut self, sink: impl Fn(PatchStep) + Send + Sync + 'static) -> Self {
+        self.reporter.patch_sink = Some(Arc::new(sink));
         self
     }
 }

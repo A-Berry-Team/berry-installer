@@ -17,7 +17,7 @@ Design notes and history: [`docs/INSTALLER.md`](docs/INSTALLER.md).
 | `sophon` | HoYoverse Sophon engine: chunk manifests, reuse of what is already on disk, install / update / repair |
 | `kuro` | Kuro Games (Wuthering Waves) engine: file index, parallel segmented downloads of big files, range patching, install / update / repair |
 | `steamrt` | `SteamRuntimeManager`: install / ensure / check for updates / reinstall the Steam Linux Runtimes |
-| `extras` | `ExtrasManager`: jadeite packages from Twintail manifests and [berry-unlock](https://github.com/A-Berry-Team/berry-unlock) from GitHub releases (`ensure_github`) |
+| `extras` | `ExtrasManager`: [berry-unlock](https://github.com/A-Berry-Team/berry-unlock) from GitHub releases (`ensure_github`) |
 | `game` / `state` | on-disk state of a game directory (`NotInstalled` / `Incomplete` / `Ready`) and marker files |
 | `progress` | `CancelToken`, `Progress` / `Phase`, throttled `Reporter`, `JobContext` |
 | `http` / `fsutil` / `hash` / `error` | shared `reqwest` client, free space, atomic writes, checksums, one error type |
@@ -138,4 +138,6 @@ range from `<file_path>/<patch_id>` with HTTP Range, and persists the ranges und
 `.berry-preload/ldiff`. Pre-download never modifies live game files. During a live update, Berry
 reuses those cached ranges (or downloads any missing ones), applies them through `berry-patcher`,
 verifies original and resulting MD5/size, and atomically replaces each game file. Manifest-declared
-deletions are delayed until all selected patches have succeeded.
+deletions are delayed until all selected patches have succeeded. `ldiff::is_cached_for_url` tells,
+without touching the network, whether a job's manifest and all its patch ranges are already cached
+(a finished pre-download), so the caller can skip the download and apply the patches directly.

@@ -34,5 +34,5 @@ pub mod steamrt;
 pub use error::{InstallError, Result};
 pub use game::GameState;
 pub use http::Http;
-pub use progress::{CancelToken, JobContext, Phase, Progress, Reporter};
+pub use progress::{CancelToken, JobContext, PatchStep, Phase, Progress, Reporter};
 pub use state::InstallState;

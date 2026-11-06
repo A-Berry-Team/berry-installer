@@ -19,6 +19,7 @@ use md5::{Digest, Md5};
 use prost::Message;
 
 use crate::error::{InstallError, IoContext, Result};
+use crate::progress::{JobContext, PatchStep, Phase, Progress};
 
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 const HASH_BUFFER: usize = 1024 * 1024;
@@ -381,15 +382,15 @@ pub async fn preload_manifest(
         .await?;
     let manifest = decode_manifest(&raw)?;
 
-    let cache_dir = game_dir.join(".berry-preload").join("ldiff");
+    let cache_dir = ldiff_cache_dir(game_dir);
     tokio::fs::create_dir_all(&cache_dir)
         .await
         .map_err(|e| InstallError::io(format!("creating {}", cache_dir.display()), e))?;
 
     // Keep the exact manifest used for the preload. Its name is stable per manifest URL and
     // makes later application independent of repository metadata changing between sessions.
-    let manifest_key = md5_hex(Md5::digest(manifest_url.as_bytes()));
-    let manifest_path = cache_dir.join(format!("manifest-{manifest_key}.pb"));
+    let manifest_key = manifest_key(manifest_url);
+    let manifest_path = cached_manifest_path(&cache_dir, manifest_url);
     let manifest_temp = cache_dir.join(format!(
         ".manifest-{manifest_key}.{}.part",
         TEMP_ID.fetch_add(1, Ordering::Relaxed)
@@ -709,11 +710,62 @@ pub fn apply_cached_manifest(
     manifest: &DiffManifest,
     from_version: &str,
 ) -> Result<u64> {
+    apply_cached_manifest_with(
+        game_dir,
+        cache_dir,
+        manifest,
+        from_version,
+        &JobContext::new(),
+    )
+}
+
+/// [`apply_cached_manifest`] that reports progress (patched bytes over the bytes to patch, in
+/// [`Phase::Patching`]) after every file, announces each patch through
+/// [`Reporter::patch`](crate::progress::Reporter::patch) and logs each file it works on, so a long
+/// apply of multi-gigabyte files is visibly alive instead of a silent "finalizing".
+pub fn apply_cached_manifest_with(
+    game_dir: &Path,
+    cache_dir: &Path,
+    manifest: &DiffManifest,
+    from_version: &str,
+    ctx: &JobContext,
+) -> Result<u64> {
+    let total_bytes: u64 = manifest
+        .files
+        .iter()
+        .filter(|file| file.patches.iter().any(|patch| patch.key == from_version))
+        .map(|file| u64::try_from(file.size).unwrap_or(0))
+        .sum();
+    let total_files = manifest
+        .files
+        .iter()
+        .filter(|file| file.patches.iter().any(|patch| patch.key == from_version))
+        .count();
+    let mut done_bytes = 0u64;
+    let mut seen = 0usize;
     let mut applied = 0u64;
     for file in &manifest.files {
         let Some(patch) = file.patches.iter().find(|patch| patch.key == from_version) else {
             continue;
         };
+        seen += 1;
+        let file_bytes = u64::try_from(file.size).unwrap_or(0);
+        ctx.reporter
+            .report_now(Progress::new(Phase::Patching, done_bytes, total_bytes));
+        ctx.reporter.patch(PatchStep {
+            index: u32::try_from(seen).unwrap_or(u32::MAX),
+            total: u32::try_from(total_files).unwrap_or(u32::MAX),
+            bytes: file_bytes,
+            done_bytes,
+            total_bytes,
+        });
+        let started = std::time::Instant::now();
+        tracing::info!(
+            "[ldiff] applying {seen}/{total_files}: {} ({} bytes)",
+            file.filename,
+            file.size
+        );
+        done_bytes = done_bytes.saturating_add(file_bytes);
         let info = patch.info.as_ref().ok_or_else(|| {
             InstallError::InvalidData(format!(
                 "LDiff patch for {} has no PatchInfo",
@@ -801,7 +853,14 @@ pub fn apply_cached_manifest(
         }
         result?;
         applied += 1;
+        tracing::info!(
+            "[ldiff] applied {seen}/{total_files}: {} in {:.1}s",
+            file.filename,
+            started.elapsed().as_secs_f32()
+        );
     }
+    ctx.reporter
+        .report_now(Progress::new(Phase::Patching, total_bytes, total_bytes));
 
     // Deletions are delayed until all file patches have succeeded.
     for deletion in manifest
@@ -848,19 +907,75 @@ fn cached_patch_path(cache_dir: &Path, info: &PatchInfo) -> Result<PathBuf> {
     Ok(cache_dir.join(format!("{}-{offset}-{length}.hdiff", info.patch_id)))
 }
 
+/// Directory holding the cached manifests and patch ranges of a game.
+fn ldiff_cache_dir(game_dir: &Path) -> PathBuf {
+    game_dir.join(".berry-preload").join("ldiff")
+}
+
+/// Stable name of a manifest in the cache: derived from its CDN URL.
+fn manifest_key(manifest_url: &str) -> String {
+    md5_hex(Md5::digest(manifest_url.as_bytes()))
+}
+
+fn cached_manifest_path(cache_dir: &Path, manifest_url: &str) -> PathBuf {
+    cache_dir.join(format!("manifest-{}.pb", manifest_key(manifest_url)))
+}
+
+/// Whether everything an LDiff job needs is already on disk: the manifest of `manifest_url` and
+/// every patch range it selects for `from_version`, each with its exact length.
+///
+/// This is a purely local check (no network). It is what lets an update that follows a
+/// pre-download go straight to applying the patches instead of contacting the CDN again. A
+/// missing, unreadable or inconsistent cache simply answers `false`: the caller then downloads
+/// the job (which still reuses whatever ranges are present) before applying it.
+pub fn is_cached_for_url(game_dir: &Path, manifest_url: &str, from_version: &str) -> bool {
+    let cache_dir = ldiff_cache_dir(game_dir);
+    let Ok(raw) = fs::read(cached_manifest_path(&cache_dir, manifest_url)) else {
+        return false;
+    };
+    let Ok(manifest) = decode_manifest(&raw) else {
+        return false;
+    };
+    manifest
+        .files
+        .iter()
+        .filter_map(|file| file.patches.iter().find(|patch| patch.key == from_version))
+        .all(|patch| {
+            let Some(info) = patch.info.as_ref() else {
+                return false;
+            };
+            let (Ok(expected), Ok(path)) = (
+                u64::try_from(info.patch_length),
+                cached_patch_path(&cache_dir, info),
+            ) else {
+                return false;
+            };
+            fs::metadata(path).is_ok_and(|metadata| metadata.len() == expected)
+        })
+}
+
 /// Apply the cached preload manifest identified by its original CDN URL.
 pub fn apply_cached_manifest_for_url(
     game_dir: &Path,
     manifest_url: &str,
     from_version: &str,
 ) -> Result<u64> {
-    let cache_dir = game_dir.join(".berry-preload").join("ldiff");
-    let manifest_key = md5_hex(Md5::digest(manifest_url.as_bytes()));
-    let manifest_path = cache_dir.join(format!("manifest-{manifest_key}.pb"));
+    apply_cached_manifest_for_url_with(game_dir, manifest_url, from_version, &JobContext::new())
+}
+
+/// [`apply_cached_manifest_for_url`] reporting progress through `ctx`.
+pub fn apply_cached_manifest_for_url_with(
+    game_dir: &Path,
+    manifest_url: &str,
+    from_version: &str,
+    ctx: &JobContext,
+) -> Result<u64> {
+    let cache_dir = ldiff_cache_dir(game_dir);
+    let manifest_path = cached_manifest_path(&cache_dir, manifest_url);
     let raw = fs::read(&manifest_path)
         .context(|| format!("reading cached LDiff manifest {}", manifest_path.display()))?;
     let manifest = decode_manifest(&raw)?;
-    apply_cached_manifest(game_dir, &cache_dir, &manifest, from_version)
+    apply_cached_manifest_with(game_dir, &cache_dir, &manifest, from_version, ctx)
 }
 
 /// Game-level marker of a finished pre-download. It holds the version the pre-download targets,
@@ -984,6 +1099,110 @@ mod tests {
         begin_preload(game, "7.3.0").unwrap();
         assert!(stale.join("part.hdiff").exists());
     }
+
+    fn manifest_with_patches(from: &str, patches: &[(&str, i64, i64)]) -> DiffManifest {
+        DiffManifest {
+            files: patches
+                .iter()
+                .enumerate()
+                .map(|(i, (patch_id, offset, length))| DiffFileInfo {
+                    filename: format!("file{i}.bin"),
+                    size: 10,
+                    hash: String::new(),
+                    patches: vec![Patch {
+                        key: from.to_owned(),
+                        info: Some(PatchInfo {
+                            patch_id: (*patch_id).to_owned(),
+                            patch_offset: *offset,
+                            patch_length: *length,
+                            ..Default::default()
+                        }),
+                    }],
+                })
+                .collect(),
+            files_delete: Vec::new(),
+        }
+    }
+
+    fn store_manifest(game: &Path, url: &str, manifest: &DiffManifest) -> PathBuf {
+        let cache = ldiff_cache_dir(game);
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cached_manifest_path(&cache, url), manifest.encode_to_vec()).unwrap();
+        cache
+    }
+
+    #[test]
+    fn a_job_is_cached_only_when_its_manifest_and_every_range_are_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let game = dir.path();
+        let url = "https://cdn.example/manifest";
+        let manifest = manifest_with_patches("5.0.0", &[("bundle", 0, 4), ("bundle", 4, 6)]);
+
+        // Nothing downloaded yet: not even the manifest.
+        assert!(!is_cached_for_url(game, url, "5.0.0"));
+
+        let cache = store_manifest(game, url, &manifest);
+        assert!(!is_cached_for_url(game, url, "5.0.0"), "ranges are missing");
+
+        fs::write(cache.join("bundle-0-4.hdiff"), [0u8; 4]).unwrap();
+        assert!(
+            !is_cached_for_url(game, url, "5.0.0"),
+            "one range is missing"
+        );
+
+        // A range with the wrong length is a broken download, not a cached one.
+        fs::write(cache.join("bundle-4-6.hdiff"), [0u8; 3]).unwrap();
+        assert!(
+            !is_cached_for_url(game, url, "5.0.0"),
+            "a range is truncated"
+        );
+
+        fs::write(cache.join("bundle-4-6.hdiff"), [0u8; 6]).unwrap();
+        assert!(is_cached_for_url(game, url, "5.0.0"));
+
+        // Another manifest URL has its own entry in the cache.
+        assert!(!is_cached_for_url(
+            game,
+            "https://cdn.example/other",
+            "5.0.0"
+        ));
+    }
+
+    #[test]
+    fn a_corrupt_cached_manifest_is_never_reported_as_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = "https://cdn.example/manifest";
+        let cache = ldiff_cache_dir(dir.path());
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(
+            cached_manifest_path(&cache, url),
+            b"\xff\xff\xff not protobuf",
+        )
+        .unwrap();
+        assert!(!is_cached_for_url(dir.path(), url, "5.0.0"));
+    }
+
+    #[test]
+    fn only_the_ranges_of_the_installed_version_have_to_be_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = "https://cdn.example/manifest";
+        let mut manifest = manifest_with_patches("5.0.0", &[("bundle", 0, 4)]);
+        // The same file also has a patch for another version that was never downloaded.
+        manifest.files[0].patches.push(Patch {
+            key: "4.9.0".into(),
+            info: Some(PatchInfo {
+                patch_id: "old".into(),
+                patch_offset: 0,
+                patch_length: 8,
+                ..Default::default()
+            }),
+        });
+        let cache = store_manifest(dir.path(), url, &manifest);
+        fs::write(cache.join("bundle-0-4.hdiff"), [0u8; 4]).unwrap();
+        assert!(is_cached_for_url(dir.path(), url, "5.0.0"));
+        assert!(!is_cached_for_url(dir.path(), url, "4.9.0"));
+    }
+
     use crate::http::Http;
     use crate::progress::{JobContext, Phase, Progress};
     use std::io::{BufRead, BufReader};
